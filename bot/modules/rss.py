@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 from feedparser import parse as feedparse
 from pyrogram.handlers import MessageHandler, CallbackQueryHandler
@@ -10,7 +11,11 @@ from aiohttp import ClientSession
 from apscheduler.triggers.interval import IntervalTrigger
 from re import split as re_split
 from io import BytesIO
-
+import cloudscraper
+import re
+import requests
+from requests import get
+from bs4 import BeautifulSoup, NavigableString, Tag
 from bot import scheduler, rss_dict, LOGGER, DATABASE_URL, config_dict, bot
 from bot.helper.telegram_helper.message_utils import sendMessage, editMessage, sendRss, sendFile
 from bot.helper.telegram_helper.filters import CustomFilters
@@ -23,7 +28,7 @@ from bot.helper.ext_utils.help_messages import RSS_HELP_MESSAGE
 
 rss_dict_lock = Lock()
 handler_dict = {}
-
+scraper = cloudscraper.create_scraper(allow_brotli=False)
 
 async def rssMenu(event):
     user_id = event.from_user.id
@@ -98,21 +103,20 @@ async def rssSub(client, message, pre_event):
             if inf is not None:
                 filters_list = inf.split('|')
                 for x in filters_list:
-                    y = x.split(' or ')
+                    y = [sub_str.lower() for sub_str in x.split(' or ')]
                     inf_lists.append(y)
             if exf is not None:
                 filters_list = exf.split('|')
                 for x in filters_list:
-                    y = x.split(' or ')
+                    y = [sub_str.lower() for sub_str in x.split(' or ')]
                     exf_lists.append(y)
         else:
             inf = None
             exf = None
             cmd = None
         try:
-            async with ClientSession(trust_env=True) as session:
-                async with session.get(feed_link) as res:
-                    html = await res.text()
+            response = scraper.get(feed_link)  # Make an asynchronous GET request using CloudScraper
+            html = response.text
             rss_d = feedparse(html)
             last_title = rss_d.entries[0]['title']
             msg += "<b>Subscribed!</b>"
@@ -134,7 +138,7 @@ async def rssSub(client, message, pre_event):
                     rss_dict[user_id] = {title: {'link': feed_link, 'last_feed': last_link, 'last_title': last_title,
                                                 'inf': inf_lists, 'exf': exf_lists, 'paused': False, 'command': cmd, 'tag': tag}}
             LOGGER.info(
-                f"Rss Feed Added: id: {user_id} - title: {title} - link: {feed_link} - c: {cmd} - inf: {inf} - exf: {exf}")
+                f"Rss Feed Added: id: {user_id} - title: {title} - c: {cmd} - inf: {inf} - exf: {exf}")
         except (IndexError, AttributeError) as e:
             emsg = f"The link: {feed_link} doesn't seem to be a RSS feed or it's region-blocked!"
             await sendMessage(message, emsg + '\nError: ' + str(e))
@@ -263,9 +267,8 @@ async def rssGet(client, message, pre_event):
         if data and count > 0:
             try:
                 msg = await sendMessage(message, f"Getting the last <b>{count}</b> item(s) from {title}")
-                async with ClientSession(trust_env=True) as session:
-                    async with session.get(data['link']) as res:
-                        html = await res.text()
+                response = scraper.get(data['link'])  # Make an asynchronous GET request using CloudScraper
+                html = response.text
                 rss_d = feedparse(html)
                 item_info = ""
                 for item_num in range(count):
@@ -328,14 +331,14 @@ async def rssEdit(client, message, pre_event):
                 if inf.lower() != 'none':
                     filters_list = inf.split('|')
                     for x in filters_list:
-                        y = x.split(' or ')
+                        y = [sub_str.lower() for sub_str in x.split(' or ')]
                         inf_lists.append(y)
                 rss_dict[user_id][title]['inf'] = inf_lists
             if exf is not None:
                 if exf.lower() != 'none':
                     filters_list = exf.split('|')
                     for x in filters_list:
-                        y = x.split(' or ')
+                        y = [sub_str.lower() for sub_str in x.split(' or ')]
                         exf_lists.append(y)
                 rss_dict[user_id][title]['exf'] = exf_lists
     if DATABASE_URL:
@@ -537,9 +540,7 @@ Timeout: 60 sec. Argument -c for command and options
         if not rss_dict:
             await query.answer(text="No subscriptions!", show_alert=True)
         else:
-            await query.answer()
-            start = int(data[3])
-            await rssList(query, start, all_users=True)
+            await query.answer(text="No subscriptions!", show_alert=True)
     elif data[1] == 'shutdown':
         if scheduler.running:
             await query.answer()
@@ -572,9 +573,8 @@ async def rssMonitor():
             try:
                 if data['paused']:
                     continue
-                async with ClientSession(trust_env=True) as session:
-                    async with session.get(data['link']) as res:
-                        html = await res.text()
+                response = scraper.get(data['link'])  # Make an asynchronous GET request using CloudScraper
+                html = response.text
                 rss_d = feedparse(html)
                 try:
                     last_link = rss_d.entries[0]['links'][1]['href']
@@ -605,28 +605,51 @@ async def rssMonitor():
                         break
                     parse = True
                     for flist in data['inf']:
-                        if all(x not in item_title.lower() for x in flist):
+                        if all(x not in str(item_title).lower() for x in flist):
                             parse = False
                             feed_count += 1
                             break
                     for flist in data['exf']:
-                        if any(x in item_title.lower() for x in flist):
+                        if any(x in str(item_title).lower() for x in flist):
                             parse = False
                             feed_count += 1
                             break
                     if not parse:
                         continue
-                    if command := data['command']:
-                        cmd = command.split(maxsplit=1)
-                        cmd.insert(1, url)
-                        feed_msg = " ".join(cmd)
-                        if not feed_msg.startswith('/'):
-                            feed_msg = f"/{feed_msg}"
-                    else:
-                        feed_msg = f"<b>Name: </b><code>{item_title.replace('>', '').replace('<', '')}</code>\n\n"
-                        feed_msg += f"<b>Link: </b><code>{url}</code>"
-                    feed_msg += f"\n<b>Tag: </b><code>{data['tag']}</code> <code>{user}</code>"
-                    await sendRss(feed_msg)
+                    pattern = [
+                        r"(.*?)(S\d{2})\s?E(P|\d{2}|\(\d{2}\s?-\s?\d{2}\))(.*)",
+                        r"(.*?)(S\d{2})\s?EP\s?(\d{2})(.*)",
+                        r"(.*?)(S\d{2})\s?EP\s?\((\d{2}-\d{2})\)(.*)",
+                        r"(.*?)(S\d{2})\s?E(\d{2})(.*)",
+                        r"(.*?)(S\d{2})\s?E\s?\((\d{2}-\d{2})\)(.*)",
+                        r"(.*?)\s(S\d{1})\s\((\d{4})\)(.*)"
+                    ]
+                    upper_tit = str(item_title).upper()
+                    for pat in pattern:
+                        match = re.match(pat, upper_tit)
+                        if match:
+                            break
+                    response = scraper.get(url)
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    for link in soup.find_all('a', href=re.compile(r'magnet:\?xt=urn:btih:')):
+                        txt = link.get('href')
+                        if len(txt) > 900:
+                            txt = txt[:900]
+                        rcb = await DbManger().check_magnets(txt)
+                        if not rcb:
+                            if command := data['command']:
+                                cmd = command.split(maxsplit=1)
+                                cmd.insert(1, txt)
+                                feed_msg = " ".join(cmd)
+                                if not feed_msg.startswith('/'):
+                                    feed_msg = f"/{feed_msg} -t https://graph.org/file/a27f4c86131d3278b3dc8.jpg"
+                            else:
+                                feed_msg = f"<b>Name: </b><code>{item_title.replace('>', '').replace('<', '')}</code>\n\n"
+                                feed_msg += f"<b><a href='{url}'>Link</a>: </b><code>{txt}</code>"
+                            feed_msg += f"\n<b>Tag: </b><code>{data['tag']}</code> <code>{user}</code>"
+                            await sendRss(feed_msg)
+                            await DbManger().processed_link(txt)
+                    await sleep(0.5)
                     feed_count += 1
                 async with rss_dict_lock:
                     if user not in rss_dict or not rss_dict[user].get(title, False):
@@ -646,6 +669,29 @@ async def rssMonitor():
     if all_paused:
         scheduler.pause()
 
+async def scrapper(client, message):
+    link = message.text.split(' ', 1)
+    if len(link) == 2:
+        link = link[1]
+    else:
+        help_msg = '''
+<b>Send link after command</b>
+'''
+        return await sendMessage(message, help_msg)     
+    try:
+        link = re.match(r"((http|https)\:\/\/)?[a-zA-Z0-9\.\/\?\:@\-_=#]+\.([a-zA-Z]){2,6}([a-zA-Z0-9\.\&\/\?\:@\-_=#])*", link)[0]
+    except TypeError:
+        return await sendMessage(message, 'Not a Valid Link.')
+    scraper = cloudscraper.create_scraper(allow_brotli=False)
+    response = scraper.get(link)
+    soup = BeautifulSoup(response.text, 'html.parser')
+    for magnet_link in soup.find_all('a', href=re.compile(r'magnet:\?xt=urn:btih:')):
+        txts = magnet_link.get('href')
+        if len(txts) > 900:
+            txts = txts[:900]
+        await sendMessage(message, txts)
+        await sleep(0.5)
+    return
 
 def addJob(delay):
     scheduler.add_job(rssMonitor, trigger=IntervalTrigger(seconds=delay), id='0', name='RSS', misfire_grace_time=15,
@@ -653,6 +699,7 @@ def addJob(delay):
 
 addJob(config_dict['RSS_DELAY'])
 scheduler.start()
+bot.add_handler(MessageHandler(scrapper, filters=command("scrape") & CustomFilters.authorized & ~CustomFilters.blacklisted))
 bot.add_handler(MessageHandler(getRssMenu, filters=command(
     BotCommands.RssCommand) & CustomFilters.authorized & ~CustomFilters.blacklisted))
 bot.add_handler(CallbackQueryHandler(rssListener, filters=regex(r"^rss")))

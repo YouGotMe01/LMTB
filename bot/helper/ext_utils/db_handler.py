@@ -180,6 +180,21 @@ class DbManger:
         await self.__db.tasks[bot_id].delete_one({'_id': link})
         self.__conn.close
 
+    async def processed_link(self, url):
+        if self.__err:
+            return
+        await self.__db.magnets.insert_one({'url': url})
+        LOGGER.info(f"Magnet saved successfully")
+
+    async def check_magnets(self, url):
+        if self.__err:
+            return False
+        csk = await self.__db.magnets.find_one({'url': url})
+        if csk:
+            return True
+        return False
+        self.__conn.close
+
     async def get_incomplete_tasks(self):
         notifier_dict = {}
         if self.__err:
